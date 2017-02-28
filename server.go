@@ -11,13 +11,11 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"os"
 	"os/exec"
+	"runtime"
 	"sync"
 	"syscall"
-	"unsafe"
 
-	"github.com/kr/pty"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -121,7 +119,7 @@ func (s *Server) handleChannel(newChannel ssh.NewChannel) {
 
 	// Sessions have out-of-band requests such as "shell", "pty-req" and "env"
 	go func() {
-		var shellf *os.File
+		var shellf *ShellFile
 
 		for req := range requests {
 			//fmt.Printf("req=%+v\n", req)
@@ -130,7 +128,12 @@ func (s *Server) handleChannel(newChannel ssh.NewChannel) {
 				req.Reply(true, nil)
 
 				cmd := parseCommand(req.Payload)
-				shell := exec.Command(s.shellPath, "-c", cmd)
+				var shell *exec.Cmd
+				if runtime.GOOS == "windows" {
+					shell = exec.Command("cmd", "/c", cmd)
+				} else {
+					shell = exec.Command(s.shellPath, "-c", cmd)
+				}
 
 				var err error
 				var in io.WriteCloser
@@ -196,49 +199,18 @@ func (s *Server) handleChannel(newChannel ssh.NewChannel) {
 					req.Reply(true, nil)
 
 					// Fire up bash for this session
-					shell := exec.Command(s.shellPath)
-
-					// Prepare teardown function
-					close := func() {
-						connection.Close()
-						_, err := shell.Process.Wait()
-						if err != nil {
-							s.logger.Printf("Failed to exit shell (%s)", err)
-						}
-						s.logger.Printf("Session closed")
-					}
-
-					// Allocate a terminal for this channel
-					s.logger.Print("Creating pty...")
-					var err error
-					shellf, err = pty.Start(shell)
-					if err != nil {
-						s.logger.Printf("Could not start pty (%s)", err)
-						close()
-						return
-					}
-
-					//pipe session to shell and visa-versa
-					var once sync.Once
-					go func() {
-						io.Copy(connection, shellf)
-						once.Do(close)
-					}()
-					go func() {
-						io.Copy(shellf, connection)
-						once.Do(close)
-					}()
+					shellf = s.startShell(s.shellPath, connection)
 				}
 			case "pty-req":
 				termLen := req.Payload[3]
 				w, h := parseDims(req.Payload[termLen+4:])
-				setWinsize(shellf.Fd(), w, h)
+				shellf.setWinsize(w, h)
 				// Responding true (OK) here will let the client
 				// know we have a pty ready for input
 				req.Reply(true, nil)
 			case "window-change":
 				w, h := parseDims(req.Payload)
-				setWinsize(shellf.Fd(), w, h)
+				shellf.setWinsize(w, h)
 			}
 		}
 	}()
@@ -270,12 +242,6 @@ type winsize struct {
 	Width  uint16
 	x      uint16 // unused
 	y      uint16 // unused
-}
-
-// SetWinsize sets the size of the given pty.
-func setWinsize(fd uintptr, w, h uint32) {
-	ws := &winsize{Width: uint16(w), Height: uint16(h)}
-	syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCSWINSZ), uintptr(unsafe.Pointer(ws)))
 }
 
 // Borrowed from https://github.com/creack/termios/blob/master/win/win.go
